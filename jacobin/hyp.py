@@ -101,7 +101,6 @@ def bnb_cdf(x, r, a, b, sf=False, eps=1e-6, max_n=1000):
     return cond(c, a_fun, b_fun, x, r, p, k)
 
 def betabinom_cdf(x, n, a, b, eps=1e-6, max_n=1000):
-    
     @jnp.vectorize
     def fun(x, n, a, b):
         k = a + b
@@ -132,3 +131,12 @@ def betabinom_cdf(x, n, a, b, eps=1e-6, max_n=1000):
         b_fun = _cdfc
         return cond(c, a_fun, b_fun, x, n, p, k)
     return fun(x, n, a, b)
+
+def hyp_2f1_rec_start(a, b, z):
+    return (1 - z) ** (-a) * (1 - (1-z) ** a - z) / (a - 1 ) / z, (1 - z) ** (-a)
+
+def hyp_2f1_rec_terms(a, b, z):
+    t1 = ( 4 -  2 * b + (b - a - 1) * z) / ((b - 1) * (z - 1))
+    t2 = (b - 3) / ((b - 1) * (z - 1))
+    return t1, t2
+    

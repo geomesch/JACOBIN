@@ -9,10 +9,16 @@ import mpmath
 import gmpy2
 import numpy as np
 from abc import ABC
+from enum import Enum
 
-from betainc import logbetainc, betainc
-from hyp import bnb_cdf
-from utils import long_vectorize
+from .betainc import logbetainc, betainc
+from .hyp import bnb_cdf
+from .hyp import hyp_2f1_rec_start, hyp_2f1_rec_terms
+from .utils import long_vectorize
+
+class CompoundDist(Enum):
+    NB = 'NB'
+    Binomial = 'Binomial'
 
 def logbinomial(n, x):
     n = jnp.array(n)
@@ -66,7 +72,7 @@ class Distribution(ABC):
             if i in x:
                 res[j] = pmf
                 j += 1
-        return res
+        return res * self._long_rec_mult(*args, **kwargs)
     
     @long_vectorize
     def long_cdf(self, x: np.ndarray, *args, **kwargs) -> np.ndarray:
@@ -104,14 +110,20 @@ class Distribution(ABC):
         start = self._rec_start(min_x, *args, **kwargs)
         for i in range(rec_order):
             res = res.at[min_x + i].set(start.at[i].get())
-        return jax.lax.fori_loop(min_x + rec_order, max_x, loop_body, res)
-        
+        return jax.lax.fori_loop(min_x + rec_order, max_x, loop_body, res) * self._rec_mult(*args, **kwargs)
+
+    def _rec_mult(self, *args, **kwargs) -> float:
+        return 1.0
+    
     def _rec_step(self, x, prevs: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
         raise NotImplementedError
     
     def _rec_start(self, x: float, *args, **kwargs) -> jnp.ndarray:
         rec = self.rec_order
         return jnp.array([self.pmf(x - rec + i, *args, **kwargs) for i in range(1, rec + 1)])
+    
+    def _long_rec_mult(self, *args, **kwargs) -> float:
+        return 1.0
     
     def _long_rec_step(self, x, prevs: jnp.ndarray, *args, **kwargs) -> gmpy2.mpfr:
         raise NotImplementedError
@@ -225,44 +237,69 @@ class TruncatedDistribution(Distribution):
 class Mixture(Distribution):
     def __init__(self, *distros, normalize_weights=True):
         self.distros = distros
-        self.norm_weights = normalize_weights
+        self.normalize_weights = normalize_weights
     
     def _update_weights(self, weights: jnp.ndarray) -> jnp.ndarray:
-        if weights == len(self.distros):
+        weights = jnp.array(weights)
+        if len(weights) == len(self.distros):
             weights = weights / weights.sum() if self.normalize_weights else weights
-        elif weights == len(self.distros) - 1:
+        elif (weights) == len(self.distros) - 1:
             weights = jnp.append(weights, 1.0 - weights.sum())
         return weights.reshape(-1, 1)
+    
+    def _long_update_weights(self, weights: np.ndarray) -> np.ndarray:
+        weights = np.array(weights)
+        if len(weights) == len(self.distros):
+            weights = weights / weights.sum() if self.normalize_weights else weights
+        elif len(weights) == len(self.distros) - 1:
+            weights = np.append(weights, 1.0 - weights.sum())
+        return weights.reshape(-1, 1)
             
-    def logpmf(self, x: jnp.ndarray, params: list[dict], weights: jnp.ndarray) -> jnp.ndarray:
+    def logpmf(self, x: jnp.ndarray, params: list[dict], weights: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
         logpmfs = list()
         weights = self._update_weights(weights)
         for params, dist in zip(params, self.distros):
-            logpmfs.append(dist.logpmf(x, **params))
+            logpmfs.append(dist.logpmf(x, *args, **kwargs, **params))
         logpmfs = jnp.array(logpmfs)
-        return jnp.logsumexp(logpmfs, axis=0, b=weights)
+        return logsumexp(logpmfs, axis=0, b=weights)
     
-    def logcdf(self, x: jnp.ndarray, params: list[dict], weights: jnp.ndarray) -> jnp.ndarray:
+    def pmf_recurrent(self, min_x: int, max_x: int,  max_sz: int, params: list[dict], weights: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
+        logpmfs = list()
+        weights = self._update_weights(weights)
+        for params, dist in zip(params, self.distros):
+            logpmfs.append(dist.pmf_recurrent(min_x, max_x, max_sz, *args, **kwargs, **params))
+        logpmfs = jnp.array(logpmfs)
+        return jnp.sum(logpmfs * weights, axis=0)
+    
+    def logcdf(self, x: jnp.ndarray, params: list[dict], weights: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
         logcdfs = list()
         weights = self._update_weights(weights)
         for params, dist in zip(params, self.distros):
-            logcdfs.append(dist.logcdf(x, **params))
+            logcdfs.append(dist.logcdf(x, *args, **kwargs, **params))
         logcdfs = jnp.array(logcdfs)
-        return jnp.logsumexp(logcdfs, axis=0, b=weights)
-    
-    def mean(self, params: list[dict], weights: jnp.ndarray) -> jnp.ndarray:
+        return logsumexp(logcdfs, axis=0, b=weights)
+
+    def long_pmf(self, x: np.ndarray, params: list[dict], weights: np.ndarray, *args, **kwargs) -> np.ndarray:
+        pmfs = list()
+        weights = self._long_update_weights(weights)
+        for params, dist in zip(params, self.distros):
+            pmfs.append(dist.long_pmf(x, *args, **kwargs, **params))
+        pmfs = np.array(pmfs)
+        return (pmfs * weights).sum(axis=0)
+
+    def mean(self, params: list[dict], weights: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
         means = list()
         weights = self._update_weights(weights)
         for params, dist in zip(params, self.distros):
-            means.append(dist.mean(**params))
+            means.append(dist.mean(*args, **kwargs, **params))
         means = jnp.array(means)
         return jnp.sum(means * weights, axis=0)
     
-    def var(self, params: list[dict], weights: jnp.ndarray) -> jnp.ndarray:
+    def var(self, params: list[dict], weights: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
         var = list()
         weights = self._update_weights(weights)
         for params, dist in zip(params, self.distros):
-            var.append(dist.var(**params))
+            var.append(dist.var(*args, **kwargs, **params))
         var = jnp.array(var)
         return jnp.sum(var * weights, axis=0)
 
@@ -425,7 +462,7 @@ class NB(BinomialFamily):
         q = 1 - p
         if not self.p_success:
             p, q = q, p
-        return prevs.at[x-1].get() * (x + r) / (x + 1) * q
+        return prevs.at[x-1].get() * (x + r - 1) / x * q
     
     def _long_rec_start(self, x: int, r, p) -> np.ndarray:
         q = 1 - p
@@ -438,7 +475,7 @@ class NB(BinomialFamily):
         q = 1 - p
         if not self.p_success:
             p, q = q, p
-        return prevs[0] * (x + r) / (x + 1) * q
+        return prevs[0] * (x + r - 1) / x * q
 
     def mean(self, r, p) -> jnp.ndarray:
         p, r = jnp.array(p), jnp.array(r)
@@ -548,3 +585,66 @@ class BetaBinomial(BetaBinomialFamily):
         num = n * a * b * (a + b + n)
         denum = (a + b) ** 2 * (a + b + 1)
         return num / denum
+
+class MCNB(BinomialFamily):
+    rec_order = 2
+    
+    def __init__(self, compound_dist=CompoundDist.NB):
+        self.dist_name = compound_dist
+    
+    def _calc_abz(self, x, r, p1, p2):
+        if self.dist_name == CompoundDist.NB:
+            return 1 + r, 1 + x, p2 * (1 - p1)
+        elif self.dist_name == CompoundDist.Binomial:
+            return 1 - r, 1 + x, -p2 * (1 - p1) / (1 - p2)
+        raise NotImplementedError
+    
+    def _rec_mult(self, r, p1, p2):
+        lt = jnp.log1p(-p2) * r
+        num = jnp.log(r) + lt + jnp.log1p(-p1) + jnp.log(p2)
+        denum = logsumexp(jnp.array([0.0, lt]), b=jnp.array([1, -1]))
+        if self.dist_name == CompoundDist.Binomial:
+            num -= jnp.log1p(-p2)
+        return jnp.exp(num - denum)
+
+    def _long_rec_mult(self, r, p1, p2):
+        mult = (1 - p2) ** r / (1 - (1 - p2) ** r) * (r  * (1 - p1) * p2)
+        if self.dist_name == CompoundDist.Binomial:
+            mult /= (1 - p2)
+        return mult
+    
+    def _rec_step(self, x, prevs: jnp.ndarray, r, p1, p2) -> jnp.ndarray:
+        a, b, z = self._calc_abz(x, r, p1, p2)
+        alpha, beta = hyp_2f1_rec_terms(a, b, z)
+        return alpha * prevs.at[x-1].get() * p1 + beta * prevs.at[x-2].get() * p1 ** 2
+    
+    def _rec_start(self, x, r, p1, p2) -> jnp.ndarray:
+        a, b, z = self._calc_abz(x, r, p1, p2)
+        t1, t2 = hyp_2f1_rec_start(a, b, z)
+        return jnp.array([t1, t2 * p1])
+    
+    def _long_rec_start(self, x, r, p1, p2) -> np.array:
+        r = gmpy2.mpfr(r)
+        p1 = gmpy2.mpfr(p1); p2 = gmpy2.mpfr(p2)
+        a, b, z = self._calc_abz(x, r, p1, p2)
+        return np.array(hyp_2f1_rec_start(a, b, z))
+
+    def mean(self, r, p1, p2):
+        num = jnp.log(p1)
+        denum = 2 * jnp.log1p(-p1) + jnp.log1p(-p2) * (r + 1)
+        if self.dist_name == CompoundDist.Binomial:
+            num += 2 * jnp.log1p(-p2)
+        return jnp.exp(num - denum) * self._rec_mult(r, p1, p2)
+    
+    def second_moment(self, r, p1, p2):
+        if self.dist_name == CompoundDist.NB:
+            num = jnp.log(p1) + jnp.log(1 + p1 - p2 + r * p1 * p2)
+            denum = jnp.log1p(-p1) * 3 + jnp.log1p(-p2) * (r + 2)
+        else:
+            num = jnp.log(p1) + jnp.log(1 + p1 + (r - 1) * p1 * p2)
+            denum = jnp.log1p(-p1) * 3 + jnp.log1p(-p2) * (r - 1)
+        return jnp.exp(num - denum)
+    
+    def var(self, r, p1, p2):
+        x, x2 = self.mean(r, p1, p2), self.second_moment(r, p1, p2)
+        return x ** 2 - x2
