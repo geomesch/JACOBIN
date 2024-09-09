@@ -240,15 +240,21 @@ class Mixture(Distribution):
         self.normalize_weights = normalize_weights
     
     def _update_weights(self, weights: jnp.ndarray) -> jnp.ndarray:
-        weights = jnp.array(weights)
+        if len(self.distros) == 2 and not jnp.iterable(weights):
+            weights = jnp.array([weights], dtype=float)
+        else:
+            weights = jnp.array(weights, dtype=float)
         if len(weights) == len(self.distros):
             weights = weights / weights.sum() if self.normalize_weights else weights
-        elif (weights) == len(self.distros) - 1:
+        elif len(weights) == len(self.distros) - 1:
             weights = jnp.append(weights, 1.0 - weights.sum())
         return weights.reshape(-1, 1)
     
     def _long_update_weights(self, weights: np.ndarray) -> np.ndarray:
-        weights = np.array(weights)
+        if len(self.distros) == 2 and not np.iterable(weights):
+            weights = np.array([weights], dtype=float)
+        else:
+            weights = np.array(weights, dtype=float)
         if len(weights) == len(self.distros):
             weights = weights / weights.sum() if self.normalize_weights else weights
         elif len(weights) == len(self.distros) - 1:
