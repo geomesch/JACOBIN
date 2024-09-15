@@ -139,12 +139,4 @@ def hyp_2f1_rec_terms(a, b, z):
     t1 = ( 4 -  2 * b + (b - a - 1) * z) / ((b - 1) * (z - 1))
     t2 = (b - 3) / ((b - 1) * (z - 1))
     return t1, t2
-
-def hyp_1f1_rec_start(a, z):
-    return 1, jnp.expm1(z) / z
-
-def hyp_1f1_rec_terms(a, z):
-    t1 = (2 * a - 4 + z) / (a - 1)
-    t2 = (3 - a) / (a - 1)
-    return t1, t2
     

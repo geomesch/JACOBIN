@@ -1,0 +1,13 @@
+README.md
+setup.py
+jacobin/__init__.py
+jacobin/betainc.py
+jacobin/distributions.py
+jacobin/hyp.py
+jacobin/reparam.py
+jacobin/utils.py
+jacobin.egg-info/PKG-INFO
+jacobin.egg-info/SOURCES.txt
+jacobin.egg-info/dependency_links.txt
+jacobin.egg-info/requires.txt
+jacobin.egg-info/top_level.txt

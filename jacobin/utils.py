@@ -1,7 +1,58 @@
 # -*- coding: utf-8 -*-
 import gmpy2
+import jax.numpy as jnp
 import numpy as np
+import jax
+from jax.scipy.linalg import toeplitz
+from collections.abc import Callable
 from itertools import chain
+
+
+def hankel(a, b):
+    a = jnp.flip(a)
+    b = jnp.append(jnp.array([0.0]), b)
+    return jnp.flip(toeplitz(a, b), axis=0)
+
+
+def recurrent_fun(rec_start: Callable[[int, ...], jnp.ndarray],
+                  rec_step: Callable[[int, jnp.ndarray, ...], float],
+                  rec_mult: Callable[[...], float], 
+                  rec_order: int,
+                  min_x: int, max_x: int, max_sz: int, *args, **kwargs) -> jnp.ndarray:
+    def loop_body(x, res):
+        res = res.at[x].set(rec_step(x, res, *args, **kwargs))
+        return res
+    
+    res = jnp.zeros(max_sz, dtype=float)
+    start = rec_start(min_x, *args, **kwargs)
+    for i in range(rec_order):
+        res = res.at[min_x + i].set(start.at[i].get())
+    return jax.lax.fori_loop(min_x + rec_order, max_x, loop_body, res) * rec_mult(*args, **kwargs)
+
+def recurrent_fun_long(rec_start: Callable[[int, ...], np.ndarray],
+                  rec_step: Callable[[int, np.ndarray, ...], float],
+                  rec_mult: Callable[[...], float], 
+                  rec_order: int,
+                  x: np.ndarray, *args, **kwargs) -> np.ndarray:
+    min_x = min(x)
+    max_x = max(x)
+    res = np.empty_like(x, dtype=object)
+    x = set(x)
+    prev = rec_start(min_x, *args, **kwargs)
+    j = 0
+
+    for i in range(rec_order):
+        if i + min_x in x:
+            res[j] = prev[i]
+            j += 1
+    for i in range(min_x + rec_order, max_x + 1):
+        val = rec_step(i, prev, *args, **kwargs)
+        prev[:-1] = prev[1:]
+        prev[-1] = val
+        if i in x:
+            res[j] = val
+            j += 1
+    return res * rec_mult(*args, **kwargs)
 
 
 def long_vectorize(fun):

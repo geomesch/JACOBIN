@@ -14,13 +14,12 @@ from enum import Enum
 from .betainc import logbetainc, betainc
 from .hyp import bnb_cdf
 from .hyp import hyp_2f1_rec_start, hyp_2f1_rec_terms
-from .utils import long_vectorize, recurrent_fun, recurrent_fun_long
+from .utils import long_vectorize
 
 class CompoundDist(Enum):
     NB = 'NB'
     Binomial = 'Binomial'
-    Poisson = 'Poisson' # TODO
- 
+
 def logbinomial(n, x):
     n = jnp.array(n)
     x = jnp.array(x)
@@ -33,7 +32,6 @@ def long_logbeta(a, b):
 class Distribution(ABC):
     
     rec_order = None
-    params = dict()
     
     def logpmf(self, x: jnp.ndarray, *args, **kwargs):
         raise NotImplementedError
@@ -78,10 +76,20 @@ class Distribution(ABC):
     
     @long_vectorize
     def long_cdf(self, x: np.ndarray, *args, **kwargs) -> np.ndarray:
-        rec_start = self._long_rec_start
-        rec_step = self._long_rec_step
-        rec_mult = self._long_rec_mult
-        return recurrent_fun_long(rec_start, rec_step, rec_mult, self.rec_order, x, *args, **kwargs)
+        res = list()
+        max_x = int(max(x))
+        x = set(x)
+        xs = list(map(gmpy2.mpz, range(max_x + 1)))
+        cdf = 0
+        pmfs = self.long_pmf(xs, *args, **kwargs)
+        prev_cdf = cdf
+        for c, pmf in enumerate(pmfs):
+            cdf += pmf
+            if cdf < 1 or ((1 - prev_cdf) > (cdf  - 1)):
+                prev_cdf = cdf if cdf <= 1 else gmpy2.mpz(1)
+            if c in x:
+                res.append(prev_cdf)
+        return np.array(res)
 
     def mean(self, *args, **kwargs) -> jnp.ndarray:
         raise NotImplementedError
@@ -93,8 +101,16 @@ class Distribution(ABC):
         raise NotImplementedError
     
     def pmf_recurrent(self, min_x: int, max_x: int, max_sz: int, *args, **kwargs):
-        return recurrent_fun(self._rec_start, self._rec_step, self._rec_mult, 
-                             self.rec_order, min_x, max_x, max_sz, *args, **kwargs)
+        def loop_body(x, res):
+            res = res.at[x].set(self._rec_step(x, res, *args, **kwargs))
+            return res
+        
+        res = jnp.zeros(max_sz, dtype=float)
+        rec_order = self.rec_order
+        start = self._rec_start(min_x, *args, **kwargs)
+        for i in range(rec_order):
+            res = res.at[min_x + i].set(start.at[i].get())
+        return jax.lax.fori_loop(min_x + rec_order, max_x, loop_body, res) * self._rec_mult(*args, **kwargs)
 
     def _rec_mult(self, *args, **kwargs) -> float:
         return 1.0
@@ -117,11 +133,8 @@ class Distribution(ABC):
 
 class TruncatedDistribution(Distribution):
     
-    params = None
-    
     def __init__(self, dist: Distribution):
         self.dist = dist
-        self.params = dist.params
     
     def _lognorm(self, *args, left=None, right=None, **kwargs) -> jnp.array:
         dist = self.dist
@@ -225,7 +238,6 @@ class Mixture(Distribution):
     def __init__(self, *distros, normalize_weights=True):
         self.distros = distros
         self.normalize_weights = normalize_weights
-        self.params['weights'] = [(0.0, 1.0)] * (len(distros) - 1)
     
     def _update_weights(self, weights: jnp.ndarray) -> jnp.ndarray:
         if len(self.distros) == 2 and not jnp.iterable(weights):
@@ -310,7 +322,6 @@ class BetaBinomialFamily(BinomialFamily):
 class Poisson(Distribution):
     
     rec_order = 1
-    params = {'rate': [(0.0, None)]}
     
     def logpmf(self, x: jnp.ndarray, rate: jnp.ndarray) -> jnp.ndarray:
         x, rate = map(jnp.array, (x, rate))
@@ -362,7 +373,6 @@ class Poisson(Distribution):
 class Binomial(BinomialFamily):
     
     rec_order = 1
-    params = {'n': [(0.0, None)], 'p': [(0.0, 1.0)]}
     
     def __init__(self, p_success=True, eps=1e-6, max_n=200):
         self.p_success = p_success
@@ -427,7 +437,6 @@ class Binomial(BinomialFamily):
 class NB(BinomialFamily):
     
     rec_order = 1
-    params = {'r': [(0.0, None)], 'p': [(0.0, 1.0)]}
     
     def __init__(self, p_success=True, eps=1e-6, max_n=200):
         self.p_success = p_success
@@ -494,7 +503,6 @@ class NB(BinomialFamily):
 class BetaNB(BetaBinomialFamily):
     
     rec_order = 1
-    params = {'r': [(0.0, None)], 'a': [(0.0, None)], 'b': [(0.0, None)]}
     
     def __init__(self, eps=1e-6, max_n=200):
         self.eps = eps
@@ -550,7 +558,6 @@ class BetaNB(BetaBinomialFamily):
 class BetaBinomial(BetaBinomialFamily):
     
     rec_order = 1
-    params = {'n': [(0.0, None)], 'a': [(0.0, None)], 'b': [(0.0, None)]}
     
     def logpmf(self, x: jnp.ndarray, n, a, b) -> jnp.ndarray:
         x, n, a, b = jnp.array(x), jnp.array(n), jnp.array(a), jnp.array(b)
@@ -587,12 +594,9 @@ class BetaBinomial(BetaBinomialFamily):
 
 class MCNB(BinomialFamily):
     rec_order = 2
-    params = {'r': [(0.0, None)], 'p1': [(0.0, 1.0)], 'p2': [(0.0, 1.0)]}
     
     def __init__(self, compound_dist=CompoundDist.NB):
         self.dist_name = compound_dist
-        if compound_dist == CompoundDist.Poisson:
-            self.params['p2'] = None
     
     def _calc_abz(self, x, r, p1, p2):
         if self.dist_name == CompoundDist.NB:
@@ -642,7 +646,7 @@ class MCNB(BinomialFamily):
         if self.dist_name == CompoundDist.NB:
             num = jnp.log(p1) + jnp.log(1 + p1 - p2 + r * p1 * p2)
             denum = jnp.log1p(-p1) * 3 + jnp.log1p(-p2) * (r + 2)
-        elif self.dist_name == CompoundDist.Binomial:
+        else:
             num = jnp.log(p1) + jnp.log(1 + p1 + (r - 1) * p1 * p2)
             denum = jnp.log1p(-p1) * 3 + jnp.log1p(-p2) * (r - 1)
         return jnp.exp(num - denum)
