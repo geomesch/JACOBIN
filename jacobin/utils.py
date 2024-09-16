@@ -16,7 +16,6 @@ def hankel(a, b):
 
 def recurrent_fun(rec_start: Callable[[int, ...], jnp.ndarray],
                   rec_step: Callable[[int, jnp.ndarray, ...], float],
-                  rec_mult: Callable[[...], float], 
                   rec_order: int,
                   min_x: int, max_x: int, max_sz: int, *args, **kwargs) -> jnp.ndarray:
     def loop_body(x, res):
@@ -27,7 +26,7 @@ def recurrent_fun(rec_start: Callable[[int, ...], jnp.ndarray],
     start = rec_start(min_x, *args, **kwargs)
     for i in range(rec_order):
         res = res.at[min_x + i].set(start.at[i].get())
-    return jax.lax.fori_loop(min_x + rec_order, max_x, loop_body, res) * rec_mult(*args, **kwargs)
+    return jax.lax.fori_loop(min_x + rec_order, max_x, loop_body, res) 
 
 def recurrent_fun_long(rec_start: Callable[[int, ...], np.ndarray],
                   rec_step: Callable[[int, np.ndarray, ...], float],

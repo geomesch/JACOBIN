@@ -4,9 +4,10 @@ This module concerns mostly effective gradient-friendly computation of 3f2
 function and CDFs of negative beta binomial and beta-binomial distributions.
 """
 import jax.numpy as jnp
-from jax.scipy.special import betaln
-from jax.lax import cond, switch, while_loop
+from jax.scipy.special import betaln, logsumexp
+from jax.lax import cond, switch, while_loop, select
 from functools import partial
+import gmpy2
 
 
 
@@ -135,13 +136,27 @@ def betabinom_cdf(x, n, a, b, eps=1e-6, max_n=1000):
 def hyp_2f1_rec_start(a, b, z):
     return (1 - z) ** (-a) * (1 - (1-z) ** a - z) / (a - 1 ) / z, (1 - z) ** (-a)
 
+def hyp_log_2f1_rec_start(a, b, log_z):
+    z = jnp.exp(log_z)
+    t2 = -jnp.log1p(-z) * a
+    t1 = t2 + logsumexp(jnp.array([-t2, jnp.log1p(-z)]), b=jnp.array([-1.0, 1.0])) - jnp.log(a - 1) - log_z
+    return t1, t2
+
 def hyp_2f1_rec_terms(a, b, z):
     t1 = ( 4 -  2 * b + (b - a - 1) * z) / ((b - 1) * (z - 1))
     t2 = (b - 3) / ((b - 1) * (z - 1))
     return t1, t2
 
 def hyp_1f1_rec_start(a, z):
-    return 1, jnp.expm1(z) / z
+    return jnp.expm1(z) / z, jnp.exp(z)
+
+def hyp_long_1f1_rec_start(a, z):
+    return gmpy2.expm1(z) / z, gmpy2.exp(z)
+
+def hyp_log_1f1_rec_start(a, log_z):
+    z = jnp.exp(log_z)
+    t = select(jnp.isfinite(jnp.exp(z)), jnp.log(jnp.exp(z) - 1), z)
+    return t - log_z, z
 
 def hyp_1f1_rec_terms(a, z):
     t1 = (2 * a - 4 + z) / (a - 1)
