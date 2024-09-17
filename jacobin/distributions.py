@@ -22,7 +22,7 @@ from .utils import long_vectorize, recurrent_fun, recurrent_fun_long
 class CompoundDist(Enum):
     NB = 'NB'
     Binomial = 'Binomial'
-    Poisson = 'Poisson' # TODO
+    Poisson = 'Poisson'
  
 def logbinomial(n, x):
     n = jnp.array(n)
@@ -61,7 +61,7 @@ class Distribution(ABC):
     
     @long_vectorize
     def long_pmf(self, x: np.ndarray, *args, **kwargs) -> np.ndarray:
-        min_x = min(x)
+        min_x = 0 # min(x) TODO
         max_x = max(x)
         res = np.empty_like(x, dtype=object)
         x = set(x)
@@ -126,28 +126,35 @@ class TruncatedDistribution(Distribution):
     
     params = None
     
-    def __init__(self, dist: Distribution):
+    def __init__(self, dist: Distribution, clip_bounds=True, eps=None):
         self.dist = dist
         self.params = dist.params
+        self.clip_bounds = clip_bounds
+        self.eps = eps
     
     def _lognorm(self, *args, left=None, right=None, **kwargs) -> jnp.array:
         dist = self.dist
+        left = None if left is None or left <= 0 else left
+        right = None if right is None or np.isinf(right) else right
         if left is None and right is None:
             denum = 0
         elif right is None:
-            denum = dist.logsf(left, *args, **kwargs)
+            denum = dist.logsf(left - 1, *args, **kwargs)
         elif left is None:
-            denum = dist.logcdf(right - 1, *args, **kwargs)
+            denum = dist.logcdf(right, *args, **kwargs)
         else:
-            a = jnp.array([dist.logcdf(right - 1, *args, **kwargs), dist.logcdf(left, *args, **kwargs)])
+            a = jnp.array([dist.logcdf(right, *args, **kwargs), dist.logcdf(left - 1, *args, **kwargs)])
             b = jnp.array([1, -1])
             denum = logsumexp(a, b=b)
         return denum
     
-    def logpmf(self, x, *args, left=None, right=None, **kwargs):
+    def logpmf(self, x, *args, left=0, right=float('inf'), **kwargs):
         dist = self.dist
         logpmf = dist.logpmf(x, *args, **kwargs)
-        return logpmf - self._lognorm(*args, left=left, right=right, **kwargs)
+        res = logpmf - self._lognorm(*args, left=left, right=right, **kwargs)
+        if self.clip_bounds:
+            res = jnp.where((x >= left) & (x <= right), res, -jnp.inf)
+        return res
     
     def logcdf(self, x, *args, left=None, right=None, **kwargs):
         dist = self.dist
@@ -178,7 +185,6 @@ class TruncatedDistribution(Distribution):
         if left is not None:
             sub += jax.lax.fori_loop(1, left, for_body, 0)
         if right is not None:
-            print(sub)
             sub += jax.lax.while_loop(while_cond, while_body, (0., 1. + eps, right))
         
         return (mean - sub) / self._lognorm(*args, left=left, right=right, **kwargs)
@@ -186,45 +192,51 @@ class TruncatedDistribution(Distribution):
     def var(self, *args, left=None, right=None, **kwargs):
         raise NotImplementedError
     
-    def logpmf_recurrent(self, min_x: int, max_x: int,  max_sz: int, *args, left=-1, right=float('inf'), **kwargs):
+    def logpmf_recurrent(self, min_x: int, max_x: int,  max_sz: int, *args, left=0, right=float('inf'), **kwargs):
         dist = self.dist
-        max_t_x = max_x
-        min_t_x = jax.lax.select(left >= 0, 0, min_x)
-        max_t_x = jax.lax.select(jnp.isfinite(right), right + 1, max_x)
-        res = dist.pmf_recurrent(min_t_x, max_t_x, *args, max_sz=max_sz, **kwargs)
+        max_t_x = jax.lax.select((right + 1.0 > max_x) & jnp.isfinite(right), right + 1.0, jnp.array(max_x).astype(float)).astype(int)
+        res = dist.logpmf_recurrent(0, max_t_x, max_sz, *args, **kwargs)
         def for_loop(x, carry):
             carry += jnp.exp(res.at[x].get())
             return carry
-        conds = [(left >= 0) & jnp.isfinite(right), (left >= 0) & jnp.isinf(right), left < 0]
+        conds = [(left > 0) & jnp.isfinite(right), (left > 0) & jnp.isinf(right), (left <= 0) & jnp.isfinite(right), (left <= 0) & jnp.isinf(right)]
         conds = sum(i * t for i, t in enumerate(conds))
+        left = jnp.array(left).astype(int); right = jnp.array(right).astype(int)
         a, b = jax.lax.select_n(conds, 
-                                *[jnp.array([left + 1, right]),  jnp.array([0, right]), jnp.array([0, left + 1])])
+                                *[jnp.array([left, right + 1]),  jnp.array([0, left]), jnp.array([0, right + 1]), jnp.array([0, 0])])
         denum = jax.lax.fori_loop(a, b, for_loop, 0.0)
-        denum = jax.lax.select((left >= 0) & jnp.isinf(right), jnp.log1p(-denum), jnp.log(denum))
-        return res - denum
+        denum = jnp.clip(denum, self.eps if self.eps is None else 0.0, 1.0)
+        denum = jax.lax.select(conds == 3, 1.0, denum)
+        denum = jax.lax.select(conds == 1, jnp.log1p(-denum), jnp.log(denum))
+        res = res - denum
+        if self.clip_bounds:
+            inds = jnp.arange(0, max_sz)
+            res = jnp.where((inds >= left) & (inds <= right), res, -jnp.inf)
+        return res
     
     @long_vectorize
-    def long_pmf(self, x: np.ndarray, *args, left=-1, right=float('inf'), **kwargs) -> np.ndarray:
+    def long_pmf(self, x: np.ndarray, *args, left=0, right=float('inf'), **kwargs) -> np.ndarray:
         dist = self.dist
         if left < 0 and np.isinf(right):
             return dist.long_pmf(x, *args, **kwargs)
         res = np.zeros(len(x), dtype=object)
-        if left < 0:
-            tx = list(range(right))
+        if left <= 0 and not np.isinf(right):
+            tx = list(range(right + 1))
             pmfs = dist.long_pmf(tx, *args, **kwargs)
             denum = sum(pmfs)
-        elif np.isinf(right):
-            tx = list(range(x.max()))
+        elif jnp.isinf(right):
+            tx = list(range(x.max() + 1))
             pmfs = dist.long_pmf(tx, *args, **kwargs)
-            denum = 1 - sum(pmfs[i] for i in range(0, left + 1))
+            denum = 1 - sum(pmfs[i] for i in range(0, left))
+
         else:
-            tx = list(range(left + 1, right))
+            tx = list(range(left, right + 1))
             pmfs = dist.long_pmf(tx, *args, **kwargs)
             denum = sum(pmfs)
         shift = tx[0]
         for i, t in enumerate(x):
             t = int(t) - shift
-            if (0 <= t < len(pmfs)):
+            if (0 <= t < len(pmfs)) and (left <= t + shift <= right):
                 res[i] = pmfs[t] / denum
         return res
             
@@ -403,7 +415,6 @@ class Binomial(BinomialFamily):
         q = 1 - p
         if not self.p_success:
             p, q = q, p
-        print(n, x)
         res = gmpy2_bincoef(n, x) * p ** x * q ** (n - x)
         return np.array([res])
     

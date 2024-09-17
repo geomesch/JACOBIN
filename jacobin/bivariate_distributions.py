@@ -83,8 +83,8 @@ class Mixture2D(SSDistribution):
     dist = None
     params = {'w': [(0.0, 1.0)]}
     
-    def __init__(self, dist: SSDistribution, *args, **kwargs):
-        self.dist = dist(*args, **kwargs)
+    def __init__(self, dist: SSDistribution):
+        self.dist = dist
         self.params.update(self.dist.params)
     
     def logpmf(self, x: jnp.ndarray, y: jnp.ndarray, w: float, *args, **kwargs) -> jnp.ndarray:
