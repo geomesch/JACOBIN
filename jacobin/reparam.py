@@ -13,7 +13,10 @@ def nbinom(mean, var, p_success=True):
     r = mean * p / (1 - p)
     return r, 1 - p if p_success else p
 
+# Shape parameters of a beta distribution with the given mean and
+# variance, var < mean * (1 - mean).
 def beta(mean, var):
-    a = mean / var
-    b = (1 - mean) / var
+    t = mean * (1 - mean) / var - 1
+    a = mean * t
+    b = (1 - mean) * t
     return a, b
