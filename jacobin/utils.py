@@ -5,7 +5,7 @@ import numpy as np
 import jax
 from jax.custom_derivatives import SymbolicZero
 from jax.scipy.linalg import toeplitz
-from jax.scipy.special import gammaln
+from jax.scipy.special import gammaln, polygamma
 from collections.abc import Callable
 
 
@@ -36,15 +36,125 @@ def _stirling(x):
     return t * res
 
 
+# Coefficients B_2k / 2k of the asymptotic series of digamma.
+_DIGAMMA_SERIES = (1.0 / 12.0, -1.0 / 120.0, 1.0 / 252.0, -1.0 / 240.0, 1.0 / 132.0, -691.0 / 32760.0, 1.0 / 12.0)
+
+
+# Terms of the asymptotic series of a difference at lo and lo + b. Returns
+# 1 / lo, b / lo, w = lo / (lo + b), d = 1 - w ** 2 and the sum of
+# coefs[k - 1] lo ** -2k (1 - w ** 2k) over k. The factor 1 - w ** 2k is
+# d (1 + w ** 2 + ... + w ** (2k - 2)), so no digits cancel, and no
+# transcendental function is called.
+def _series_diff(lo, b, coefs):
+    u = 1.0 / lo
+    t = b * u
+    w = 1.0 / (1.0 + t)
+    q = w * w
+    d = t * (2.0 + t) * q
+    u2 = u * u
+    uk, qk, part, res = u2, 1.0, 0.0, 0.0
+    for c in coefs:
+        part = part + qk
+        res = res + c * uk * part
+        qk, uk = qk * q, uk * u2
+    return u, t, w, d, d * res
+
+
+# digamma(a) - digamma(a + b) for positive a and b, without the
+# cancellation of the difference when b is much smaller than a. Below 10
+# a is shifted up by 10 with digamma(x) = digamma(x + 10) - sum_{i<10} 1 / (x + i),
+# then the asymptotic series is taken for both terms at once.
+@jax.custom_jvp
+def digamma_diff(a, b):
+    a, b = jnp.asarray(a, dtype=float), jnp.asarray(b, dtype=float)
+    shift = a < 10.0
+    corr = 0.0
+    for i in range(10):
+        corr = corr + b / ((a + i) * (a + b + i))
+    lo = jnp.where(shift, a + 10.0, a)
+    u, t, w, d, series = _series_diff(lo, b, _DIGAMMA_SERIES)
+    res = -log1p(t) - 0.5 * t * u * w - series
+    return res - jnp.where(shift, corr, 0.0)
+
+
+# The tangent of out: the sum of the partials times the tangents. A
+# partial is a function called only for a tangent that is not a symbolic
+# zero, so the partial of a constant argument costs nothing.
+def _tangent(out, partials, tangents):
+    res = None
+    for partial, t in zip(partials, tangents):
+        if not isinstance(t, SymbolicZero):
+            res = partial() * t if res is None else res + partial() * t
+    return jnp.zeros_like(out) if res is None else jnp.broadcast_to(res, jnp.shape(out))
+
+
+def _digamma_diff_jvp(primals, tangents):
+    a, b = primals
+    out = digamma_diff(a, b)
+    return out, _tangent(out, (lambda: trigamma_diff(a, b), lambda: -polygamma(1, a + b)), tangents)
+
+
+digamma_diff.defjvp(_digamma_diff_jvp, symbolic_zeros=True)
+
+
+# Coefficients B_2k of the asymptotic series of trigamma.
+_TRIGAMMA_SERIES = (1.0 / 6.0, -1.0 / 30.0, 1.0 / 42.0, -1.0 / 30.0, 5.0 / 66.0, -691.0 / 2730.0, 7.0 / 6.0)
+
+
+# trigamma(a) - trigamma(a + b) for positive a and b, built as digamma_diff.
+# A term lo ** -(2k + 1) (1 - w ** (2k + 1)) is split as
+# lo ** -(2k + 1) ((1 - w) + w (1 - w ** 2k)), with 1 - w = t w.
+@jax.custom_jvp
+def trigamma_diff(a, b):
+    a, b = jnp.asarray(a, dtype=float), jnp.asarray(b, dtype=float)
+    shift = a < 10.0
+    corr = 0.0
+    for i in range(10):
+        corr = corr + b * (2.0 * (a + i) + b) / ((a + i) * (a + b + i)) ** 2
+    lo = jnp.where(shift, a + 10.0, a)
+    u, t, w, d, series = _series_diff(lo, b, _TRIGAMMA_SERIES)
+    plain = 0.0
+    uk = u * u
+    for c in _TRIGAMMA_SERIES:
+        plain = plain + c * uk
+        uk = uk * u * u
+    res = t * u * w + 0.5 * u * u * d + u * w * (t * plain + series)
+    return res + jnp.where(shift, corr, 0.0)
+
+
+def _trigamma_diff_jvp(primals, tangents):
+    a, b = primals
+    out = trigamma_diff(a, b)
+    partials = (lambda: polygamma(2, a) - polygamma(2, a + b), lambda: -polygamma(2, a + b))
+    return out, _tangent(out, partials, tangents)
+
+
+trigamma_diff.defjvp(_trigamma_diff_jvp, symbolic_zeros=True)
+
+
 # Logarithm of the beta function with one call of gammaln. The larger
 # argument goes through the Stirling series, shifted up by 10 with
 # B(lo, hi) = B(lo, hi + 10) prod_{i<10} (lo + hi + i) / (hi + i) if it
 # is below 10. A sum of three gammaln values loses the digits that
-# cancel, and betaln of jax.scipy.special is accurate to 7e-7 only.
+# cancel, and betaln of jax.scipy.special is accurate to 7e-7 only. The
+# derivatives come from digamma_diff: traced through the series, they
+# take many times longer to compile.
+@jax.custom_jvp
 def betaln(a, b):
+    return _betaln(a, b)
+
+
+def _betaln_jvp(primals, tangents):
+    a, b = primals
+    out = betaln(a, b)
+    return out, _tangent(out, (lambda: digamma_diff(a, b), lambda: digamma_diff(b, a)), tangents)
+
+
+betaln.defjvp(_betaln_jvp, symbolic_zeros=True)
+
+
+def _betaln(a, b):
     a, b = jnp.asarray(a, dtype=float), jnp.asarray(b, dtype=float)
-    # minimum and maximum halve the derivatives at a == b, the second
-    # derivatives come out wrong there.
     first = a < b
     lo, hi = jnp.where(first, a, b), jnp.where(first, b, a)
     both = lo >= 10.0
@@ -66,6 +176,8 @@ def betaln(a, b):
 # Wraps a function of scalar arguments built on while loops. The result
 # is differentiable in forward and reverse mode to any order: partial
 # derivatives are taken in forward mode and are wrapped the same way.
+# The value comes out of the loop of the partials, so an order of
+# derivatives adds one loop to the compiled program.
 def loop_differentiable(fun: Callable) -> Callable:
     partials = dict()
 
@@ -75,19 +187,38 @@ def loop_differentiable(fun: Callable) -> Callable:
 
     def jvp(primals, tangents):
         active = tuple(i for i, t in enumerate(tangents) if not isinstance(t, SymbolicZero))
-        out = wrapped(*primals)
         if not active:
+            out = wrapped(*primals)
             return out, jax.tree_util.tree_map(jnp.zeros_like, out)
         if active not in partials:
-            partials[active] = loop_differentiable(jax.jacfwd(fun, argnums=active))
+            partials[active] = loop_differentiable(_value_and_partials(fun, active))
+        out, parts = partials[active](*primals)
         tangent = None
-        for i, part in zip(active, partials[active](*primals)):
-            term = jax.tree_util.tree_map(lambda t: t * tangents[i], part)
+        for k, i in enumerate(active):
+            term = jax.tree_util.tree_map(lambda t: t[k] * tangents[i], parts)
             tangent = term if tangent is None else jax.tree_util.tree_map(jnp.add, tangent, term)
         return out, tangent
 
     wrapped.defjvp(jvp, symbolic_zeros=True)
     return wrapped
+
+
+# Builds fun(*args) -> (value, partials) for the arguments with indices in
+# active. Every leaf of partials has a leading axis over active. The
+# forward passes for all of the arguments are batched over one loop.
+def _value_and_partials(fun: Callable, active: tuple) -> Callable:
+    def res(*args):
+        def of_active(*values):
+            full = list(args)
+            for i, value in zip(active, values):
+                full[i] = value
+            return fun(*full)
+
+        def push(v):
+            tangents = [v[k] * jnp.ones_like(args[i]) for k, i in enumerate(active)]
+            return jax.jvp(of_active, [args[i] for i in active], tangents)
+        return jax.vmap(push, out_axes=(None, 0))(jnp.eye(len(active)))
+    return res
 
 
 # One step of the compensated summation by Kahan: adds inc to the sum s

@@ -147,3 +147,49 @@ def test_vmap_over_parameters():
         np.testing.assert_allclose(rows, dist.logsf(x, r[:, None], p[:, None]), rtol=1e-13)
         grads = jax.vmap(jax.grad(lambda r, p: dist.logpmf(x, r, p).sum()))(r, p)
         assert grads.shape == (3,) and np.all(np.isfinite(np.asarray(grads)))
+
+
+def _count_loops(jaxpr) -> int:
+    n = 0
+    for eqn in jaxpr.eqns:
+        n += eqn.primitive.name == 'while'
+        for p in eqn.params.values():
+            for sub in (p if isinstance(p, (list, tuple)) else [p]):
+                if hasattr(sub, 'eqns'):
+                    n += _count_loops(sub)
+                elif hasattr(sub, 'jaxpr'):
+                    n += _count_loops(sub.jaxpr if hasattr(sub.jaxpr, 'eqns') else sub.jaxpr.jaxpr)
+    return n
+
+
+# A derivative of any order of a series takes the value and the partials
+# from a single loop, so the compiled program stays small.
+def test_one_loop_at_every_order():
+    from jacobin import hyp
+    series = hyp.series_logsum(hyp.bnb_upper_ratio, hyp.bnb_upper_bound)
+    fun = lambda v: series(10.0, 4.0, v[0], v[1], v[2])
+    v = jnp.array([3.0, 20.0, 5.0])
+    for f in (fun, jax.jacfwd(fun), jax.grad(fun), jax.jacfwd(jax.jacfwd(fun)), jax.jacfwd(jax.jacfwd(jax.jacfwd(fun)))):
+        assert _count_loops(jax.make_jaxpr(f)(v).jaxpr) == 1
+
+
+# Derivatives of betaln up to the second order over twelve decades of both
+# arguments, against mpmath. The differences of digamma and trigamma are
+# where the plain formulas lose digits, at b much smaller than a.
+def test_betaln_derivatives_against_mpmath():
+    import mpmath as mp
+    from jacobin.utils import betaln
+    rng = np.random.default_rng(0)
+    a, b = 10 ** rng.uniform(-6, 6, (2, 200))
+    a, b = np.append(a, [40.0, 1e4, 10.0, 2.1e3]), np.append(b, [4e-8, 2.5, 1e-6, 1.1e-4])
+    with mp.workdps(50):
+        psi = lambda k, u: mp.digamma(u) if k == 0 else mp.polygamma(k, u)
+        want = np.array([[float(psi(k, mp.mpf(u)) - psi(k, mp.mpf(u) + mp.mpf(v))) for u, v in zip(a, b)] for k in (0, 1)]
+                        + [[float(psi(0, mp.mpf(v)) - psi(0, mp.mpf(u) + mp.mpf(v))) for u, v in zip(a, b)],
+                           [float(-psi(1, mp.mpf(u) + mp.mpf(v))) for u, v in zip(a, b)]])
+    grad = np.asarray(jax.jit(jax.vmap(jax.grad(betaln, argnums=(0, 1))))(a, b))
+    hess = np.asarray(jax.jit(jax.vmap(jax.hessian(betaln, argnums=(0, 1))))(a, b))
+    np.testing.assert_allclose(grad[0], want[0], rtol=1e-14)
+    np.testing.assert_allclose(grad[1], want[2], rtol=1e-14)
+    np.testing.assert_allclose(hess[0][0], want[1], rtol=1e-13)
+    np.testing.assert_allclose(hess[0][1], want[3], rtol=1e-13)
